@@ -6,9 +6,9 @@
 // =====================================================================
 session_start();
 
-$host = 'localhost';
+$host = 'suntorn.railway.internal';
 $username = 'mysql';
-$password = 'password';
+$password = 'naZxvtvyPDaSmvUNQskZykxfPADPdBvm';
 $dbname = 'pos_system';
 
 $conn = new mysqli($host, $username, $password, $dbname);
