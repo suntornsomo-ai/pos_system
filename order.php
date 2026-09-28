@@ -6,22 +6,82 @@
 // =====================================================================
 session_start();
 
-$host = 'suntorn.railway.internal';
+$host = 'localhost';
 $username = 'mysql';
-$password = 'naZxvtvyPDaSmvUNQskZykxfPADPdBvm';
+$password = 'password';
 $dbname = 'pos_system';
 
+mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
 $conn = new mysqli($host, $username, $password, $dbname);
-if ($conn->connect_error) {
-    die("เชื่อมต่อฐานข้อมูลไม่ได้: " . $conn->connect_error);
-}
 $conn->set_charset("utf8mb4");
+$conn->query("SET time_zone = '+07:00'");
 
-// รองรับสถานะรอชำระสำหรับฐานข้อมูลเดิม
-$coStatusRes = $conn->query("SHOW COLUMNS FROM customer_orders LIKE 'status'");
-$coStatusRow = $coStatusRes ? $coStatusRes->fetch_assoc() : null;
-if ($coStatusRow && strpos((string)$coStatusRow['Type'], "'payment_pending'") === false) {
-    $conn->query("ALTER TABLE customer_orders MODIFY status ENUM('pending','accepted','served','payment_pending','cancelled','loaded') NOT NULL DEFAULT 'pending'");
+function initializeOrderSchema(mysqli $conn): void {
+    if (!empty($_SESSION['order_schema_ready_v2'])) return;
+    $ddl = [
+        "CREATE TABLE IF NOT EXISTS products (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            sku VARCHAR(50) DEFAULT '',
+            category VARCHAR(100) DEFAULT '',
+            cost_price DECIMAL(10,2) DEFAULT 0,
+            price DECIMAL(10,2) NOT NULL,
+            stock INT NOT NULL DEFAULT 0,
+            barcode VARCHAR(100) DEFAULT NULL,
+            image MEDIUMTEXT DEFAULT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE IF NOT EXISTS settings (
+            setting_key VARCHAR(100) PRIMARY KEY,
+            setting_value TEXT NOT NULL DEFAULT ''
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE IF NOT EXISTS restaurant_tables (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            table_no VARCHAR(50) NOT NULL UNIQUE,
+            qr_token VARCHAR(64) NOT NULL UNIQUE,
+            is_active TINYINT(1) NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE IF NOT EXISTS customer_orders (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            table_id INT NOT NULL,
+            customer_note VARCHAR(255) DEFAULT '',
+            status ENUM('pending','accepted','served','payment_pending','cancelled','loaded') NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_corder_status(status),
+            INDEX idx_corder_table(table_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE IF NOT EXISTS customer_order_items (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            order_id INT NOT NULL,
+            product_id INT NOT NULL,
+            product_name VARCHAR(200) NOT NULL,
+            price DECIMAL(10,2) NOT NULL DEFAULT 0,
+            quantity INT NOT NULL,
+            note VARCHAR(255) DEFAULT '',
+            INDEX idx_citem_order(order_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE IF NOT EXISTS bill_requests (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            table_id INT NOT NULL,
+            status ENUM('pending','done') NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_bill_status(status)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    ];
+    foreach ($ddl as $sql) $conn->query($sql);
+    $co = $conn->query("SELECT COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='customer_orders' AND COLUMN_NAME='status'")->fetch_assoc();
+    if ($co && strpos((string)$co['Type'], "'payment_pending'") === false) {
+        $conn->query("ALTER TABLE customer_orders MODIFY status ENUM('pending','accepted','served','payment_pending','cancelled','loaded') NOT NULL DEFAULT 'pending'");
+    }
+    $_SESSION['order_schema_ready_v2'] = 1;
+}
+
+try {
+    initializeOrderSchema($conn);
+} catch (Throwable $e) {
+    http_response_code(500);
+    die("เตรียมฐานข้อมูลไม่สำเร็จ: " . htmlspecialchars($e->getMessage(), ENT_QUOTES, 'UTF-8'));
 }
 
 function jsonResponse($data) {
@@ -102,12 +162,65 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         jsonResponse(['success'=>true,'message'=>'ส่งออเดอร์เรียบร้อยแล้ว พนักงานจะมารับออเดอร์เร็วๆ นี้','order_id'=>$orderId]);
     }
 
+    if ($action === 'request_bill') {
+        $token = trim((string)($_POST['token'] ?? ''));
+        if ($token === '') jsonResponse(['success'=>false,'message'=>'ไม่พบโต๊ะ กรุณาสแกน QR อีกครั้ง']);
+
+        $stmt = $conn->prepare("SELECT id, table_no FROM restaurant_tables WHERE qr_token=? AND is_active=1 LIMIT 1");
+        $stmt->bind_param('s',$token);
+        $stmt->execute();
+        $table = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+        if (!$table) jsonResponse(['success'=>false,'message'=>'ไม่พบโต๊ะนี้ หรือโต๊ะถูกปิดใช้งาน']);
+
+        $stmt = $conn->prepare("SELECT id,status FROM customer_orders WHERE table_id=? AND status<>'cancelled' ORDER BY id DESC LIMIT 1");
+        $tableId=(int)$table['id'];
+        $stmt->bind_param('i',$tableId);
+        $stmt->execute();
+        $order=$stmt->get_result()->fetch_assoc();
+        $stmt->close();
+        if (!$order) jsonResponse(['success'=>false,'message'=>'ยังไม่มีออเดอร์ของโต๊ะนี้']);
+
+        $existing=$conn->prepare("SELECT id FROM bill_requests WHERE table_id=? AND status='pending' ORDER BY id DESC LIMIT 1");
+        $existing->bind_param('i',$tableId);
+        $existing->execute();
+        $existingRow=$existing->get_result()->fetch_assoc();
+        $existing->close();
+
+        if (!$existingRow) {
+            $stmt=$conn->prepare("INSERT INTO bill_requests(table_id,status) VALUES(?,'pending')");
+            $stmt->bind_param('i',$tableId);
+            $stmt->execute();
+            $stmt->close();
+        }
+
+        // เมื่อออเดอร์เสิร์ฟแล้ว ให้เปลี่ยนเป็น "รอชำระ" เพื่อให้ทั้งลูกค้าและ POS เห็นสถานะเดียวกัน
+        if (in_array($order['status'], ['served','loaded'], true)) {
+            $stmt=$conn->prepare("UPDATE customer_orders SET status='payment_pending' WHERE id=?");
+            $orderId=(int)$order['id'];
+            $stmt->bind_param('i',$orderId);
+            $stmt->execute();
+            $stmt->close();
+        }
+
+        jsonResponse(['success'=>true,'message'=>'ส่งคำขอเรียกเก็บเงินให้พนักงานแล้ว','order_id'=>(int)$order['id']]);
+    }
+
     if ($action === 'order_status') {
+        $token = trim((string)($_POST['token'] ?? ''));
         $ids = array_filter(array_map('intval', explode(',', $_POST['order_ids'] ?? '')));
-        if (!count($ids)) jsonResponse(['success'=>true,'data'=>[]]);
+        if ($token === '' || !count($ids)) jsonResponse(['success'=>true,'data'=>[]]);
         $in = implode(',', $ids);
-        $result = $conn->query("SELECT id, status, created_at FROM customer_orders WHERE id IN ($in) ORDER BY id DESC");
-        $rows = []; while ($r = $result->fetch_assoc()) $rows[] = $r;
+        $stmt = $conn->prepare("SELECT co.id, co.status, co.created_at
+                                FROM customer_orders co
+                                JOIN restaurant_tables t ON t.id=co.table_id
+                                WHERE t.qr_token=? AND t.is_active=1 AND co.id IN ($in)
+                                ORDER BY co.id DESC");
+        $stmt->bind_param('s',$token);
+        $stmt->execute();
+        $result=$stmt->get_result();
+        $rows=[]; while($r=$result->fetch_assoc()) $rows[]=$r;
+        $stmt->close();
         jsonResponse(['success'=>true,'data'=>$rows]);
     }
 
@@ -344,13 +457,16 @@ textarea,input.note{border-color:#e2e8f0!important;border-radius:10px!important}
       <div class="order-line"></div>
       <div class="order-step" data-step="payment_pending"><span>4</span><b>รอชำระ</b></div>
     </div>
+    <button type="button" id="requestBillBtn" onclick="requestBill()" style="margin-top:12px;width:100%;padding:11px 14px;border:0;border-radius:10px;background:#f59e0b;color:#fff;font-weight:800;cursor:pointer">
+      <i class="fa-solid fa-receipt"></i> เรียกเก็บเงิน
+    </button>
   </div>
 </div>
 
 <div class="chips" id="chips">
   <button type="button" class="chip active" data-category="all">ทั้งหมด</button>
   <?php foreach ($categories as $c): ?>
-    <button class="chip" onclick="filterCat('<?= htmlspecialchars(addslashes($c), ENT_QUOTES) ?>',this)"><?= htmlspecialchars($c) ?></button>
+    <button type="button" class="chip" data-category="<?= htmlspecialchars($c, ENT_QUOTES) ?>"><?= htmlspecialchars($c) ?></button>
   <?php endforeach; ?>
 </div>
 
@@ -372,7 +488,7 @@ textarea,input.note{border-color:#e2e8f0!important;border-radius:10px!important}
         <?php if ($out): ?>
           <span style="font-size:10px;color:#ef4444;font-weight:700">ของหมด</span>
         <?php else: ?>
-          <button class="add" onclick='addItem(<?= (int)$p['id'] ?>, <?= json_encode($p['name'], JSON_UNESCAPED_UNICODE) ?>, <?= (float)$p['price'] ?>)'>+</button>
+          <button type="button" class="add" data-id="<?= (int)$p['id'] ?>" data-name="<?= htmlspecialchars($p['name'], ENT_QUOTES) ?>" data-price="<?= (float)$p['price'] ?>">+</button>
         <?php endif; ?>
       </div>
     </div>
@@ -409,7 +525,7 @@ const TOKEN = <?= json_encode($token) ?>;
 let cart = [];
 const STORAGE_KEY = 'orders_'+TOKEN;
 
-function esc(s){return String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}
+function esc(s){return String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;')}
 function money(v){return Number(v||0).toLocaleString('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2});}
 function api(action,data={}){
   const f=new URLSearchParams(); f.append('action',action);
@@ -520,9 +636,34 @@ function submitOrder(){
       if(btn){btn.disabled=false;btn.style.opacity='';btn.style.pointerEvents='';}
     });
 }
+let billRequestBusy=false;
+function requestBill(){
+  if(billRequestBusy) return;
+  billRequestBusy=true;
+  const btn=document.getElementById('requestBillBtn');
+  if(btn){btn.disabled=true;btn.style.opacity='.65';}
+  api('request_bill',{token:TOKEN}).then(d=>{
+    alert(d.message||'ส่งคำขอเรียกเก็บเงินแล้ว');
+    if(d.success){
+      saveOrderId(d.order_id);
+      refreshStatus();
+    }
+  }).catch(()=>alert('ส่งคำขอเรียกเก็บเงินไม่สำเร็จ กรุณาลองใหม่'))
+    .finally(()=>{
+      billRequestBusy=false;
+      if(btn){btn.disabled=false;btn.style.opacity='';}
+    });
+}
 function saveOrderId(id){
-  let ids=JSON.parse(localStorage.getItem(STORAGE_KEY)||'[]');
-  ids.push(id); localStorage.setItem(STORAGE_KEY, JSON.stringify(ids));
+  try{
+    let ids=JSON.parse(localStorage.getItem(STORAGE_KEY)||'[]');
+    if(!Array.isArray(ids))ids=[];
+    const n=Number(id);
+    if(n && !ids.includes(n))ids.push(n);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(ids));
+  }catch(e){
+    console.warn('localStorage unavailable',e);
+  }
 }
 function statusLabel(s){
   return {
@@ -530,6 +671,7 @@ function statusLabel(s){
     accepted:['<span class="status-pill st-accepted">กำลังเตรียม</span>'],
     served:['<span class="status-pill st-served">เสร็จแล้ว</span>'],
     payment_pending:['<span class="status-pill st-payment">รอชำระ</span>'],
+    loaded:['<span class="status-pill st-payment">รอชำระ</span>'],
     cancelled:['<span class="status-pill" style="background:#fee2e2;color:#991b1b">ยกเลิก</span>']
   }[s]?.[0] || s;
 }
@@ -584,7 +726,7 @@ function refreshStatus(){
     return;
   }
 
-  api('order_status',{order_ids:ids.join(',')})
+  api('order_status',{token:TOKEN,order_ids:ids.join(',')})
     .then(d=>{
       if(!d || !d.success){
         el.innerHTML='<div class="empty" style="color:#b45309">ไม่สามารถตรวจสอบสถานะได้ กำลังลองใหม่...</div>';
@@ -620,7 +762,8 @@ setInterval(refreshStatus, 3000);
 
 // ถ้ามีออเดอร์เก่าของโต๊ะนี้ค้างอยู่ ให้แสดงปุ่มดูสถานะเล็กๆ มุมขวาบน
 (function(){
-  let ids=JSON.parse(localStorage.getItem(STORAGE_KEY)||'[]');
+  let ids=[];
+  try{ ids=JSON.parse(localStorage.getItem(STORAGE_KEY)||'[]'); }catch(e){ ids=[]; }
   if(ids.length){
     const b=document.createElement('button');
     b.textContent='ดูสถานะออเดอร์';
