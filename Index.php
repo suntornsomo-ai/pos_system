@@ -5,11 +5,12 @@
 date_default_timezone_set('Asia/Bangkok');
 session_start();
 
-$host = 'suntorn.railway.internal';
+$host = 'localhost';
 $username = 'mysql';
-$password = 'naZxvtvyPDaSmvUNQskZykxfPADPdBvm';
+$password = 'password';
 $dbname = 'pos_system';
 
+mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
 $conn = new mysqli($host, $username, $password, $dbname);
 if ($conn->connect_error) {
     die("เชื่อมต่อฐานข้อมูลไม่ได้: " . $conn->connect_error);
@@ -29,98 +30,289 @@ function money($v) {
     return number_format((float)$v, 2);
 }
 
-// ========================= AUTH / USER MANAGEMENT =========================
-$conn->query("CREATE TABLE IF NOT EXISTS users (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    username VARCHAR(100) NOT NULL UNIQUE,
-    password VARCHAR(255) NOT NULL,
-    fullname VARCHAR(150) NOT NULL DEFAULT '',
-    role ENUM('admin','staff') NOT NULL DEFAULT 'staff',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+// ========================= DATABASE / SCHEMA =========================
+// สร้าง/ปรับโครงสร้างฐานข้อมูลก่อนรับ POST เสมอ เพื่อให้การติดตั้งใหม่
+// สามารถ Login / ขาย / Void / ปิดรอบ / สั่งผ่าน QR ได้ตั้งแต่ request แรก
 
-
-// เตรียมโครงสร้างระบบ Void ก่อนรับ POST action เพื่อให้ action=void_item
-// ใช้งานได้ทันทีแม้ฐานข้อมูลเดิมยังไม่มีคอลัมน์/ตาราง Void
-foreach ([
-    'voided_qty' => "ALTER TABLE order_items ADD COLUMN voided_qty INT NOT NULL DEFAULT 0 AFTER quantity",
-    'void_reason' => "ALTER TABLE order_items ADD COLUMN void_reason VARCHAR(255) NULL AFTER voided_qty",
-    'voided_at' => "ALTER TABLE order_items ADD COLUMN voided_at DATETIME NULL AFTER void_reason",
-    'voided_by' => "ALTER TABLE order_items ADD COLUMN voided_by VARCHAR(150) NULL AFTER voided_at",
-] as $col => $ddl) {
-    $chk = $conn->query("SHOW COLUMNS FROM order_items LIKE '$col'");
-    if ($chk && $chk->num_rows === 0) {
+function ensureColumn(mysqli $conn, string $table, string $column, string $ddl): void {
+    // ขั้นตอนติดตั้งต้องไม่ส่ง ? placeholder ให้ MariaDB โดยตรง
+    // เพราะ DDL/metadata บางคำสั่งมีพฤติกรรมต่างกันระหว่าง MariaDB versions
+    // ชื่อตารางและคอลัมน์มาจากโค้ดภายในเท่านั้น จึง escape ก่อนประกอบ SQL ได้อย่างปลอดภัย
+    $tableEsc = $conn->real_escape_string($table);
+    $columnEsc = $conn->real_escape_string($column);
+    $sql = "SELECT COUNT(*) AS c
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = '{$tableEsc}'
+              AND COLUMN_NAME = '{$columnEsc}'";
+    $row = $conn->query($sql)->fetch_assoc();
+    $exists = ((int)($row['c'] ?? 0)) > 0;
+    if (!$exists) {
         $conn->query($ddl);
     }
 }
-$conn->query("CREATE TABLE IF NOT EXISTS stock_movements (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    product_id INT NOT NULL,
-    movement_type ENUM('IN','OUT','VOID') NOT NULL,
-    quantity INT NOT NULL,
-    stock_before INT NULL,
-    stock_after INT NULL,
-    reference_type VARCHAR(50) DEFAULT NULL,
-    reference_id INT NULL,
-    reason VARCHAR(255) DEFAULT '',
-    created_by VARCHAR(150) DEFAULT '',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_stock_product_date(product_id,created_at),
-    INDEX idx_stock_type_date(movement_type,created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
-// เก็บ User ผู้ขายไว้กับแต่ละบิล เพื่อให้รายงาน Cashier แยกยอดตามผู้ขายได้ถูกต้อง
-$ordersCreatedByChk = $conn->query("SHOW COLUMNS FROM orders LIKE 'created_by'");
-if ($ordersCreatedByChk && $ordersCreatedByChk->num_rows === 0) {
-    $conn->query("ALTER TABLE orders ADD COLUMN created_by VARCHAR(150) NOT NULL DEFAULT '' AFTER payment_method");
+function initializeDatabase(mysqli $conn): void {
+    static $initialized = false;
+    if ($initialized || !empty($_SESSION['pos_schema_ready_v5'])) return;
+
+    $ddl = [
+        "CREATE TABLE IF NOT EXISTS users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(100) NOT NULL UNIQUE,
+            password VARCHAR(255) NOT NULL,
+            fullname VARCHAR(150) NOT NULL DEFAULT '',
+            role VARCHAR(20) NOT NULL DEFAULT 'staff',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+
+        "CREATE TABLE IF NOT EXISTS products (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            sku VARCHAR(50) DEFAULT '',
+            category VARCHAR(100) DEFAULT '',
+            cost_price DECIMAL(10,2) DEFAULT 0,
+            price DECIMAL(10,2) NOT NULL,
+            stock INT NOT NULL DEFAULT 0,
+            barcode VARCHAR(100) DEFAULT NULL,
+            image MEDIUMTEXT DEFAULT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+
+        "CREATE TABLE IF NOT EXISTS orders (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            receipt_no VARCHAR(20) DEFAULT NULL,
+            total_amount DECIMAL(10,2) NOT NULL,
+            subtotal_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+            discount_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+            vat_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+            cash_given DECIMAL(10,2) NOT NULL DEFAULT 0,
+            change_amount DECIMAL(10,2) NOT NULL DEFAULT 0,
+            payment_method VARCHAR(20) NOT NULL DEFAULT 'cash',
+            created_by VARCHAR(150) NOT NULL DEFAULT '',
+            vat_included TINYINT(1) NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+
+        "CREATE TABLE IF NOT EXISTS order_items (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            order_id INT NOT NULL,
+            product_id INT NOT NULL,
+            price DECIMAL(10,2) NOT NULL,
+            quantity INT NOT NULL,
+            voided_qty INT NOT NULL DEFAULT 0,
+            void_reason VARCHAR(255) DEFAULT NULL,
+            voided_at DATETIME NULL,
+            voided_by VARCHAR(150) DEFAULT NULL,
+            total DECIMAL(10,2) NOT NULL,
+            KEY idx_order_items_order(order_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+
+        "CREATE TABLE IF NOT EXISTS settings (
+            setting_key VARCHAR(100) PRIMARY KEY,
+            setting_value TEXT NOT NULL DEFAULT ''
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+
+        "CREATE TABLE IF NOT EXISTS stock_movements (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            product_id INT NOT NULL,
+            movement_type ENUM('IN','OUT','VOID') NOT NULL,
+            quantity INT NOT NULL,
+            stock_before INT NULL,
+            stock_after INT NULL,
+            reference_type VARCHAR(50) DEFAULT NULL,
+            reference_id INT NULL,
+            reason VARCHAR(255) DEFAULT '',
+            created_by VARCHAR(150) DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_stock_product_date(product_id,created_at),
+            INDEX idx_stock_type_date(movement_type,created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+
+        "CREATE TABLE IF NOT EXISTS void_logs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            order_id INT NOT NULL,
+            order_item_id INT NOT NULL,
+            product_id INT NOT NULL,
+            product_name VARCHAR(255) NOT NULL,
+            void_qty INT NOT NULL,
+            refund_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+            reason VARCHAR(255) NOT NULL DEFAULT 'Void สินค้า',
+            voided_by VARCHAR(150) NOT NULL DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_void_order(order_id),
+            INDEX idx_void_item(order_item_id),
+            INDEX idx_void_created(created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+
+        "CREATE TABLE IF NOT EXISTS receipt_counter (
+            id TINYINT PRIMARY KEY,
+            current_no INT NOT NULL DEFAULT 0
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+
+        "CREATE TABLE IF NOT EXISTS day_closings (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            closing_date DATE NOT NULL,
+            round_no INT NOT NULL DEFAULT 1,
+            start_at DATETIME NULL,
+            end_at DATETIME NULL,
+            total_sales DECIMAL(12,2) NOT NULL DEFAULT 0,
+            bill_count INT NOT NULL DEFAULT 0,
+            cash_total DECIMAL(12,2) NOT NULL DEFAULT 0,
+            staff VARCHAR(100) DEFAULT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_day_closing_date_round (closing_date,round_no),
+            INDEX idx_day_closing_end_at (end_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+
+        "CREATE TABLE IF NOT EXISTS cashier_closings (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            closing_no VARCHAR(30) NOT NULL,
+            closing_date DATE NOT NULL,
+            staff_id INT NULL,
+            staff_username VARCHAR(100) DEFAULT NULL,
+            staff_name VARCHAR(150) DEFAULT NULL,
+            sales_total DECIMAL(12,2) NOT NULL DEFAULT 0,
+            vat_total DECIMAL(12,2) NOT NULL DEFAULT 0,
+            cash_sales DECIMAL(12,2) NOT NULL DEFAULT 0,
+            expected_cash DECIMAL(12,2) NOT NULL DEFAULT 0,
+            cash_counted DECIMAL(12,2) NOT NULL DEFAULT 0,
+            cash_out DECIMAL(12,2) NOT NULL DEFAULT 0,
+            variance DECIMAL(12,2) NOT NULL DEFAULT 0,
+            denominations_json LONGTEXT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_cashier_closing_date(closing_date),
+            INDEX idx_cashier_created_at(created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+
+        "CREATE TABLE IF NOT EXISTS cashier_cash_outs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            cash_out_no VARCHAR(40) NOT NULL,
+            staff_id INT NULL,
+            staff_username VARCHAR(100) DEFAULT NULL,
+            staff_name VARCHAR(150) DEFAULT NULL,
+            amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+            denominations_json LONGTEXT NULL,
+            note VARCHAR(255) DEFAULT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_cash_out_created_at(created_at),
+            INDEX idx_cash_out_staff(staff_username)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+
+        "CREATE TABLE IF NOT EXISTS restaurant_tables (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            table_no VARCHAR(50) NOT NULL UNIQUE,
+            qr_token VARCHAR(64) NOT NULL UNIQUE,
+            is_active TINYINT(1) NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+
+        "CREATE TABLE IF NOT EXISTS customer_orders (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            table_id INT NOT NULL,
+            customer_note VARCHAR(255) DEFAULT '',
+            status ENUM('pending','accepted','served','payment_pending','cancelled','loaded') NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_corder_status(status),
+            INDEX idx_corder_table(table_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+
+        "CREATE TABLE IF NOT EXISTS customer_order_items (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            order_id INT NOT NULL,
+            product_id INT NOT NULL,
+            product_name VARCHAR(200) NOT NULL,
+            price DECIMAL(10,2) NOT NULL DEFAULT 0,
+            quantity INT NOT NULL,
+            note VARCHAR(255) DEFAULT '',
+            INDEX idx_citem_order(order_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+
+        "CREATE TABLE IF NOT EXISTS bill_requests (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            table_id INT NOT NULL,
+            status ENUM('pending','done') NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_bill_status(status)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    ];
+
+    foreach ($ddl as $idx => $sql) {
+        // ทุกคำสั่งในขั้นตอนสร้าง Schema ต้องเป็น SQL ที่ MariaDB execute ได้ตรง ๆ
+        try {
+            $conn->query($sql);
+        } catch (Throwable $e) {
+            throw new RuntimeException('Schema step ' . ($idx + 1) . ': ' . $e->getMessage());
+        }
+    }
+
+    ensureColumn($conn, 'orders', 'receipt_no', "ALTER TABLE orders ADD COLUMN receipt_no VARCHAR(20) NULL AFTER id");
+    ensureColumn($conn, 'orders', 'subtotal_amount', "ALTER TABLE orders ADD COLUMN subtotal_amount DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER total_amount");
+    ensureColumn($conn, 'orders', 'discount_amount', "ALTER TABLE orders ADD COLUMN discount_amount DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER subtotal_amount");
+    ensureColumn($conn, 'orders', 'vat_amount', "ALTER TABLE orders ADD COLUMN vat_amount DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER discount_amount");
+    ensureColumn($conn, 'orders', 'payment_method', "ALTER TABLE orders ADD COLUMN payment_method VARCHAR(20) NOT NULL DEFAULT 'cash' AFTER change_amount");
+    ensureColumn($conn, 'orders', 'created_by', "ALTER TABLE orders ADD COLUMN created_by VARCHAR(150) NOT NULL DEFAULT '' AFTER payment_method");
+    ensureColumn($conn, 'orders', 'vat_included', "ALTER TABLE orders ADD COLUMN vat_included TINYINT(1) NOT NULL DEFAULT 0");
+    // ตรวจ index ผ่าน information_schema แทน SHOW เพื่อให้เข้ากันได้กับ MariaDB ทุกรุ่น
+    $receiptIndexSql = "SELECT COUNT(*) AS c FROM information_schema.STATISTICS
+                         WHERE TABLE_SCHEMA = DATABASE()
+                           AND TABLE_NAME = 'orders'
+                           AND INDEX_NAME = 'uq_orders_receipt_no'";
+    $receiptIndex = $conn->query($receiptIndexSql)->fetch_assoc();
+    if ((int)($receiptIndex['c'] ?? 0) > 0) {
+        $conn->query("ALTER TABLE orders DROP INDEX uq_orders_receipt_no");
+    }
+
+    ensureColumn($conn, 'order_items', 'voided_qty', "ALTER TABLE order_items ADD COLUMN voided_qty INT NOT NULL DEFAULT 0 AFTER quantity");
+    ensureColumn($conn, 'order_items', 'void_reason', "ALTER TABLE order_items ADD COLUMN void_reason VARCHAR(255) NULL AFTER voided_qty");
+    ensureColumn($conn, 'order_items', 'voided_at', "ALTER TABLE order_items ADD COLUMN voided_at DATETIME NULL AFTER void_reason");
+    ensureColumn($conn, 'order_items', 'voided_by', "ALTER TABLE order_items ADD COLUMN voided_by VARCHAR(150) NULL AFTER voided_at");
+
+    ensureColumn($conn, 'products', 'sku', "ALTER TABLE products ADD COLUMN sku VARCHAR(50) DEFAULT '' AFTER name");
+    ensureColumn($conn, 'products', 'category', "ALTER TABLE products ADD COLUMN category VARCHAR(100) DEFAULT '' AFTER sku");
+    ensureColumn($conn, 'products', 'cost_price', "ALTER TABLE products ADD COLUMN cost_price DECIMAL(10,2) NOT NULL DEFAULT 0 AFTER category");
+    ensureColumn($conn, 'products', 'image', "ALTER TABLE products ADD COLUMN image MEDIUMTEXT NULL AFTER barcode");
+    $imgSql = "SELECT DATA_TYPE FROM information_schema.COLUMNS
+               WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'products' AND COLUMN_NAME = 'image'";
+    $img = $conn->query($imgSql)->fetch_assoc();
+    if ($img && strtolower((string)$img['DATA_TYPE']) !== 'mediumtext') {
+        $conn->query("ALTER TABLE products MODIFY image MEDIUMTEXT NULL");
+    }
+
+    ensureColumn($conn, 'day_closings', 'round_no', "ALTER TABLE day_closings ADD COLUMN round_no INT NOT NULL DEFAULT 1 AFTER closing_date");
+    ensureColumn($conn, 'day_closings', 'start_at', "ALTER TABLE day_closings ADD COLUMN start_at DATETIME NULL AFTER round_no");
+    ensureColumn($conn, 'day_closings', 'end_at', "ALTER TABLE day_closings ADD COLUMN end_at DATETIME NULL AFTER start_at");
+    ensureColumn($conn, 'cashier_closings', 'vat_total', "ALTER TABLE cashier_closings ADD COLUMN vat_total DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER sales_total");
+
+    $coSql = "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
+              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'customer_orders' AND COLUMN_NAME = 'status'";
+    $co = $conn->query($coSql)->fetch_assoc();
+    if ($co && strpos((string)$co['COLUMN_TYPE'], "'loaded'") === false) {
+        $conn->query("ALTER TABLE customer_orders MODIFY status ENUM('pending','accepted','served','payment_pending','cancelled','loaded') NOT NULL DEFAULT 'pending'");
+    }
+
+    $conn->query("INSERT IGNORE INTO receipt_counter (id,current_no) VALUES (1,0)");
+
+    $u = $conn->query("SELECT COUNT(*) AS c FROM users")->fetch_assoc();
+    if ((int)$u['c'] === 0) {
+        // ห้ามใช้ placeholder (?) ในขั้นตอนติดตั้ง เพราะบาง MariaDB configuration
+        // อาจส่ง SQL ของ installation ผ่าน query() แทน prepare()
+        $adminHash = $conn->real_escape_string(password_hash('admin1234', PASSWORD_DEFAULT));
+        $adminUser = $conn->real_escape_string('admin');
+        $adminName = $conn->real_escape_string('Initial Admin');
+        $conn->query("INSERT INTO users(username,password,fullname,role) VALUES ('{$adminUser}','{$adminHash}','{$adminName}','admin')");
+    }
+
+    $_SESSION['pos_schema_ready_v5'] = 1;
+    $initialized = true;
 }
 
 try {
-    $vcChk = $conn->query("SHOW COLUMNS FROM cashier_closings LIKE 'vat_total'");
-    if ($vcChk && $vcChk->num_rows === 0) {
-        $conn->query("ALTER TABLE cashier_closings ADD COLUMN vat_total DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER sales_total");
-    }
-} catch (Throwable $e) { /* ตารางจะถูกสร้างภายหลัง */ }
-// vat_included=1: ราคาสินค้ารวม VAT แล้ว (ยอดชำระไม่บวก VAT เพิ่ม) / 0 = บิลเก่าที่บวก VAT เพิ่ม
-$vatIncChk = $conn->query("SHOW COLUMNS FROM orders LIKE 'vat_included'");
-if ($vatIncChk && $vatIncChk->num_rows === 0) {
-    $conn->query("ALTER TABLE orders ADD COLUMN vat_included TINYINT(1) NOT NULL DEFAULT 0");
+    initializeDatabase($conn);
+} catch (Throwable $e) {
+    http_response_code(500);
+    die("เตรียมฐานข้อมูลไม่สำเร็จ: " . htmlspecialchars($e->getMessage(), ENT_QUOTES, 'UTF-8'));
 }
-
-$conn->query("CREATE TABLE IF NOT EXISTS void_logs (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    order_id INT NOT NULL,
-    order_item_id INT NOT NULL,
-    product_id INT NOT NULL,
-    product_name VARCHAR(255) NOT NULL,
-    void_qty INT NOT NULL,
-    refund_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
-    reason VARCHAR(255) NOT NULL DEFAULT 'Void สินค้า',
-    voided_by VARCHAR(150) NOT NULL DEFAULT '',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_void_order(order_id), INDEX idx_void_item(order_item_id), INDEX idx_void_created(created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
-// ตั้งค่าร้านต้องพร้อมใช้งานก่อนรับ POST checkout เพื่อให้สร้าง QR พร้อมเพย์ได้แม้เป็นการติดตั้งใหม่
-$conn->query("CREATE TABLE IF NOT EXISTS settings (
-    setting_key VARCHAR(100) PRIMARY KEY,
-    setting_value TEXT NOT NULL DEFAULT ''
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
-// เงินออกระหว่างรอบ Cashier: ใช้ได้ทันทีโดยไม่ต้องปิดรอบ
-$conn->query("CREATE TABLE IF NOT EXISTS cashier_cash_outs (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    cash_out_no VARCHAR(40) NOT NULL,
-    staff_id INT NULL,
-    staff_username VARCHAR(100) DEFAULT NULL,
-    staff_name VARCHAR(150) DEFAULT NULL,
-    amount DECIMAL(12,2) NOT NULL DEFAULT 0,
-    denominations_json LONGTEXT NULL,
-    note VARCHAR(255) DEFAULT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_cash_out_created_at (created_at),
-    INDEX idx_cash_out_staff (staff_username)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
 $currentUser = $_SESSION['pos_user'] ?? null;
 $isLoggedIn = is_array($currentUser) && !empty($currentUser['id']);
@@ -149,7 +341,7 @@ if ($isLoggedIn) {
     }
 }
 $isAdmin = $isLoggedIn && strtolower(trim((string)($currentUser['role'] ?? ''))) === 'admin';
-$adminActions = ['products','add_product','update_product','delete_product','sales_history','stock_report','close_day','settings_get','settings_save','users_list','user_save','user_delete','tables_list','table_save','table_delete','void_item','void_search_today'];
+$adminActions = ['add_product','update_product','delete_product','sales_history','stock_report','close_day','settings_save','users_list','user_save','user_delete','tables_list','table_save','table_delete','void_item','void_search_today'];
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
     $action = $_POST['action'];
@@ -441,6 +633,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 
             $conn->begin_transaction();
 
+            // ล็อกสินค้าเรียงตาม Product ID เดียวกันทุกบิล ลดโอกาสเกิด Deadlock
+            usort($cart, static function($a,$b){
+                return (int)($a['id'] ?? 0) <=> (int)($b['id'] ?? 0);
+            });
+
             $validated = [];
             $subtotal = 0;
 
@@ -562,7 +759,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 'total'=>money($grandTotal),
                 'cash'=>money($cash),
                 'change'=>money($change),
-                'payment_method'=>$paymentMethod
+                'payment_method'=>$paymentMethod,
+                'items'=>array_map(static function($p){
+                    return [
+                        'name'=>(string)$p['name'],
+                        'price'=>(float)$p['price'],
+                        'qty'=>(int)$p['qty'],
+                        'total'=>(float)$p['total']
+                    ];
+                }, $validated)
             ]);
         }
 
@@ -1147,11 +1352,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 
             $stmt = $conn->prepare(
                 "SELECT
-                    COALESCE(SUM(total_amount),0) total_sales,
-                    COUNT(id) bill_count,
-                    COALESCE(SUM(cash_given),0) cash_total
-                 FROM orders
-                 WHERE created_at >= ? AND created_at < DATE_ADD(?, INTERVAL 1 DAY)"
+                    COALESCE(SUM(GREATEST(0,o.total_amount-COALESCE(v.void_total,0))),0) total_sales,
+                    COUNT(CASE WHEN GREATEST(0,o.total_amount-COALESCE(v.void_total,0)) > 0 THEN o.id END) bill_count,
+                    COALESCE(SUM(CASE WHEN o.payment_method='cash'
+                        THEN GREATEST(0,(o.cash_given-o.change_amount)-COALESCE(v.void_total,0))
+                        ELSE 0 END),0) cash_total
+                 FROM orders o
+                 LEFT JOIN (SELECT order_id,SUM(refund_amount) void_total FROM void_logs GROUP BY order_id) v ON v.order_id=o.id
+                 WHERE o.created_at >= ? AND o.created_at < DATE_ADD(?, INTERVAL 1 DAY)"
             );
             $stmt->bind_param("ss",$sessionStart,$date);
             $stmt->execute();
@@ -1216,11 +1424,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             // สรุปเฉพาะยอดของรอบที่กำลังจะปิด
             $stmt = $conn->prepare(
                 "SELECT
-                    COALESCE(SUM(total_amount),0) total_sales,
-                    COUNT(id) bill_count,
-                    COALESCE(SUM(cash_given),0) cash_total
-                 FROM orders
-                 WHERE created_at >= ? AND created_at <= ?"
+                    COALESCE(SUM(GREATEST(0,o.total_amount-COALESCE(v.void_total,0))),0) total_sales,
+                    COUNT(CASE WHEN GREATEST(0,o.total_amount-COALESCE(v.void_total,0)) > 0 THEN o.id END) bill_count,
+                    COALESCE(SUM(CASE WHEN o.payment_method='cash'
+                        THEN GREATEST(0,(o.cash_given-o.change_amount)-COALESCE(v.void_total,0))
+                        ELSE 0 END),0) cash_total
+                 FROM orders o
+                 LEFT JOIN (SELECT order_id,SUM(refund_amount) void_total FROM void_logs GROUP BY order_id) v ON v.order_id=o.id
+                 WHERE o.created_at >= ? AND o.created_at <= ?"
             );
             $stmt->bind_param("ss",$sessionStart,$now);
             $stmt->execute();
@@ -1289,24 +1500,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         }
 
         if ($action === 'settings_save') {
-            $shop = trim($_POST['shopName'] ?? '');
-            $address = trim($_POST['companyAddress'] ?? '');
-            $phone = trim($_POST['companyPhone'] ?? '');
-            $taxId = trim($_POST['companyTaxId'] ?? '');
-            $prompt = trim($_POST['promptpayId'] ?? '');
-            $autoPrint = ($_POST['autoPrint'] ?? '1') === '1' ? '1' : '0';
-            $kitchenPrint = ($_POST['kitchenPrint'] ?? '0') === '1' ? '1' : '0';
-
-            foreach ([
-                'shopName'=>$shop,
-                'companyAddress'=>$address,
-                'companyPhone'=>$phone,
-                'companyTaxId'=>$taxId,
-                'promptpayId'=>$prompt,
-                'autoPrint'=>$autoPrint,
-                'kitchenPrint'=>$kitchenPrint
-            ] as $key=>$value) {
-                $stmt=$conn->prepare(
+            // อัปเดตเฉพาะค่าที่ส่งมา เพื่อไม่ให้สวิตช์ Auto Print / Kitchen Print
+            // เขียนทับชื่อร้าน ที่อยู่ เบอร์โทร หรือเลขภาษีด้วยค่าว่าง
+            $allowedSettings = [
+                'shopName','companyAddress','companyPhone','companyTaxId',
+                'promptpayId','autoPrint','kitchenPrint'
+            ];
+            foreach ($allowedSettings as $key) {
+                if (!array_key_exists($key, $_POST)) continue;
+                $value = trim((string)$_POST[$key]);
+                if (in_array($key, ['autoPrint','kitchenPrint'], true)) {
+                    $value = $value === '1' ? '1' : '0';
+                }
+                $stmt = $conn->prepare(
                     "INSERT INTO settings(setting_key,setting_value)
                      VALUES(?,?)
                      ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value)"
@@ -1325,209 +1531,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
     }
 }
 
-// ตรวจสอบและสร้างโครงสร้างคอลัมน์ใหม่ในตาราง orders หากยังไม่มี
-$receiptCol = $conn->query("SHOW COLUMNS FROM orders LIKE 'receipt_no'");
-if ($receiptCol && $receiptCol->num_rows == 0) {
-    $conn->query("ALTER TABLE orders ADD COLUMN receipt_no VARCHAR(20) NULL AFTER id");
-}
-// เลิกใช้ UNIQUE KEY เดิม เพราะเลขที่บิลแบบวิ่ง 00001-99999 จะถูกวนกลับมาใช้ซ้ำได้ตามรอบโดยตั้งใจ
-$idx = $conn->query("SHOW INDEX FROM orders WHERE Key_name='uq_orders_receipt_no'");
-if ($idx && $idx->num_rows > 0) {
-    $conn->query("ALTER TABLE orders DROP INDEX uq_orders_receipt_no");
-}
-// เพิ่มคอลัมน์สำหรับเก็บยอดก่อนส่วนลด / ส่วนลด / VAT / ช่องทางชำระเงิน ต่อบิล
-foreach ([
-    'subtotal_amount' => "ALTER TABLE orders ADD COLUMN subtotal_amount DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER total_amount",
-    'discount_amount' => "ALTER TABLE orders ADD COLUMN discount_amount DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER subtotal_amount",
-    'vat_amount'       => "ALTER TABLE orders ADD COLUMN vat_amount DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER discount_amount",
-    'payment_method'   => "ALTER TABLE orders ADD COLUMN payment_method VARCHAR(20) NOT NULL DEFAULT 'cash' AFTER change_amount",
-] as $col => $ddl) {
-    $chk = $conn->query("SHOW COLUMNS FROM orders LIKE '$col'");
-    if ($chk && $chk->num_rows == 0) $conn->query($ddl);
-}
-
-// ระบบ Void สินค้า: เก็บจำนวนที่ Void และผู้ทำรายการใน order_items
-foreach ([
-    'voided_qty' => "ALTER TABLE order_items ADD COLUMN voided_qty INT NOT NULL DEFAULT 0 AFTER quantity",
-    'void_reason' => "ALTER TABLE order_items ADD COLUMN void_reason VARCHAR(255) NULL AFTER voided_qty",
-    'voided_at' => "ALTER TABLE order_items ADD COLUMN voided_at DATETIME NULL AFTER void_reason",
-    'voided_by' => "ALTER TABLE order_items ADD COLUMN voided_by VARCHAR(150) NULL AFTER voided_at",
-] as $col => $ddl) {
-    $chk = $conn->query("SHOW COLUMNS FROM order_items LIKE '$col'");
-    if ($chk && $chk->num_rows == 0) $conn->query($ddl);
-}
-$conn->query("CREATE TABLE IF NOT EXISTS void_logs (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    order_id INT NOT NULL,
-    order_item_id INT NOT NULL,
-    product_id INT NOT NULL,
-    product_name VARCHAR(255) NOT NULL,
-    void_qty INT NOT NULL,
-    refund_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
-    reason VARCHAR(255) NOT NULL DEFAULT 'Void สินค้า',
-    voided_by VARCHAR(150) NOT NULL DEFAULT '',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_void_order(order_id), INDEX idx_void_item(order_item_id), INDEX idx_void_created(created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
-// ตารางเก็บเลขที่บิลแบบวิ่ง (Running Number) 00001-99999 ไม่ซ้ำกัน วนกลับเป็น 00001 เมื่อครบ 99999
-$conn->query("CREATE TABLE IF NOT EXISTS receipt_counter (
-    id TINYINT PRIMARY KEY,
-    current_no INT NOT NULL DEFAULT 0
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-$conn->query("INSERT IGNORE INTO receipt_counter (id, current_no) VALUES (1, 0)");
-
-$conn->query("CREATE TABLE IF NOT EXISTS day_closings (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    closing_date DATE NOT NULL,
-    round_no INT NOT NULL DEFAULT 1,
-    start_at DATETIME NULL,
-    end_at DATETIME NULL,
-    total_sales DECIMAL(12,2) NOT NULL DEFAULT 0,
-    bill_count INT NOT NULL DEFAULT 0,
-    cash_total DECIMAL(12,2) NOT NULL DEFAULT 0,
-    staff VARCHAR(100) DEFAULT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_day_closing_date_round (closing_date, round_no),
-    INDEX idx_day_closing_end_at (end_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
-foreach ([
-    "round_no" => "ALTER TABLE day_closings ADD COLUMN round_no INT NOT NULL DEFAULT 1 AFTER closing_date",
-    "start_at" => "ALTER TABLE day_closings ADD COLUMN start_at DATETIME NULL AFTER round_no",
-    "end_at" => "ALTER TABLE day_closings ADD COLUMN end_at DATETIME NULL AFTER start_at"
-] as $col=>$alterSql) {
-    $chk=$conn->query("SHOW COLUMNS FROM day_closings LIKE '".$col."'");
-    if ($chk && $chk->num_rows===0) $conn->query($alterSql);
-}
-
-// ตารางปิดรอบ Cashier / นับเงินตามธนบัตรและเหรียญ / เงินคืนออก
-$conn->query("CREATE TABLE IF NOT EXISTS cashier_closings (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    closing_no VARCHAR(30) NOT NULL,
-    closing_date DATE NOT NULL,
-    staff_id INT NULL,
-    staff_username VARCHAR(100) DEFAULT NULL,
-    staff_name VARCHAR(150) DEFAULT NULL,
-    sales_total DECIMAL(12,2) NOT NULL DEFAULT 0,
-    cash_sales DECIMAL(12,2) NOT NULL DEFAULT 0,
-    expected_cash DECIMAL(12,2) NOT NULL DEFAULT 0,
-    cash_counted DECIMAL(12,2) NOT NULL DEFAULT 0,
-    cash_out DECIMAL(12,2) NOT NULL DEFAULT 0,
-    variance DECIMAL(12,2) NOT NULL DEFAULT 0,
-    denominations_json LONGTEXT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_cashier_closing_date (closing_date),
-    INDEX idx_cashier_created_at (created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
-// เงินออกระหว่างรอบ: บันทึกได้ทันทีโดยไม่ต้องปิดรอบ Cashier
-$conn->query("CREATE TABLE IF NOT EXISTS cashier_cash_outs (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    cash_out_no VARCHAR(40) NOT NULL,
-    staff_id INT NULL,
-    staff_username VARCHAR(100) DEFAULT NULL,
-    staff_name VARCHAR(150) DEFAULT NULL,
-    amount DECIMAL(12,2) NOT NULL DEFAULT 0,
-    denominations_json LONGTEXT NULL,
-    note VARCHAR(255) DEFAULT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_cash_out_created_at (created_at),
-    INDEX idx_cash_out_staff (staff_username)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
-$conn->query("CREATE TABLE IF NOT EXISTS settings (
-    setting_key VARCHAR(100) PRIMARY KEY,
-    setting_value TEXT NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
-// ตารางโต๊ะร้านอาหาร + QR Code สำหรับให้ลูกค้าสั่งอาหารเอง
-$conn->query("CREATE TABLE IF NOT EXISTS restaurant_tables (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    table_no VARCHAR(50) NOT NULL UNIQUE,
-    qr_token VARCHAR(64) NOT NULL UNIQUE,
-    is_active TINYINT(1) NOT NULL DEFAULT 1,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
-// ตารางออเดอร์ที่ลูกค้าสั่งเองผ่านการสแกน QR บนโต๊ะ
-$conn->query("CREATE TABLE IF NOT EXISTS customer_orders (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    table_id INT NOT NULL,
-    customer_note VARCHAR(255) DEFAULT '',
-    status ENUM('pending','accepted','served','payment_pending','cancelled','loaded') NOT NULL DEFAULT 'pending',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_corder_status (status),
-    INDEX idx_corder_table (table_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
-// เพิ่มสถานะ loaded สำหรับออเดอร์ที่โหลดเข้าตะกร้า POS แล้ว (รองรับฐานข้อมูลเดิม)
-$coStatusRes = $conn->query("SHOW COLUMNS FROM customer_orders LIKE 'status'");
-$coStatusRow = $coStatusRes ? $coStatusRes->fetch_assoc() : null;
-if ($coStatusRow && strpos((string)$coStatusRow['Type'], "'payment_pending'") === false) {
-    $conn->query("ALTER TABLE customer_orders MODIFY status ENUM('pending','accepted','served','payment_pending','cancelled','loaded') NOT NULL DEFAULT 'pending'");
-}
-
-$conn->query("CREATE TABLE IF NOT EXISTS customer_order_items (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    order_id INT NOT NULL,
-    product_id INT NOT NULL,
-    product_name VARCHAR(200) NOT NULL,
-    price DECIMAL(10,2) NOT NULL DEFAULT 0,
-    quantity INT NOT NULL,
-    note VARCHAR(255) DEFAULT '',
-    INDEX idx_citem_order (order_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
-// ตารางคำขอเรียกเก็บเงินจากลูกค้า (กดจากหน้า order.php)
-$conn->query("CREATE TABLE IF NOT EXISTS bill_requests (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    table_id INT NOT NULL,
-    status ENUM('pending','done') NOT NULL DEFAULT 'pending',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_bill_status (status)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
-// ตรวจสอบตาราง/คอลัมน์ products อย่างปลอดภัย
-// ป้องกัน Error: "Attempt to read property num_rows on bool"
-// และ "Call to a member function fetch_assoc() on bool"
-
-// ตรวจสอบว่าตาราง products มีอยู่จริง
-$tableCheck = $conn->query("SHOW TABLES LIKE 'products'");
-if ($tableCheck === false) {
-    die("ตรวจสอบตาราง products ไม่สำเร็จ: " . htmlspecialchars($conn->error));
-}
-
-if ($tableCheck->num_rows === 0) {
-    die("ไม่พบตาราง products ในฐานข้อมูล " . htmlspecialchars($dbname) .
-        ". กรุณาสร้างตาราง products ก่อนใช้งาน POS");
-}
-$tableCheck->free();
-
-// เพิ่มคอลัมน์ที่จำเป็นทีละตัว
-$requiredColumns = [
-    'sku' => "ALTER TABLE products ADD COLUMN sku VARCHAR(50) DEFAULT '' AFTER name",
-    'category' => "ALTER TABLE products ADD COLUMN category VARCHAR(100) DEFAULT '' AFTER sku",
-    'cost_price' => "ALTER TABLE products ADD COLUMN cost_price DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER category",
-    'image' => "ALTER TABLE products ADD COLUMN image TEXT NULL AFTER barcode"
-];
-
-foreach ($requiredColumns as $column => $ddl) {
-    $safeColumn = $conn->real_escape_string($column);
-    $colCheck = $conn->query("SHOW COLUMNS FROM products LIKE '$safeColumn'");
-
-    if ($colCheck === false) {
-        die("ตรวจสอบคอลัมน์ products.$column ไม่สำเร็จ: " . htmlspecialchars($conn->error));
-    }
-
-    $columnExists = $colCheck->num_rows > 0;
-    $colCheck->free();
-
-    if (!$columnExists && !$conn->query($ddl)) {
-        die("เพิ่มคอลัมน์ products.$column ไม่สำเร็จ: " . htmlspecialchars($conn->error));
-    }
-}
-
 // โหลดสินค้า และตรวจสอบผล Query ก่อน fetch_assoc()
 $result = $conn->query(
     "SELECT id, name, sku, category, cost_price, price, stock, barcode, image
@@ -1543,6 +1546,11 @@ while ($r = $result->fetch_assoc()) {
     $products[] = $r;
 }
 $result->free();
+$productCategories = array_values(array_unique(array_filter(array_map(
+    static fn($p) => trim((string)($p['category'] ?? '')),
+    $products
+))));
+sort($productCategories, SORT_NATURAL | SORT_FLAG_CASE);
 ?>
 <!doctype html>
 <html lang="th">
@@ -2362,10 +2370,11 @@ button.bg-emerald-600,button.bg-green-600{background:#4f7059!important}
         <input id="searchSale" class="search" oninput="filterSale()" placeholder="ค้นหา Barcode / SKU / ชื่อสินค้า...">
       </div>
     </div>
-    <div class="chips">
-      <button class="chip active" onclick="filterCategory('all',this)">ทั้งหมด</button>
-      <button class="chip" onclick="filterCategory('เครื่องดื่ม',this)">เครื่องดื่ม</button>
-      <button class="chip" onclick="filterCategory('อาหาร',this)">อาหาร</button>
+    <div class="chips" id="saleCategoryChips">
+      <button type="button" class="chip active" data-category="all" onclick="filterCategory('all',this)">ทั้งหมด</button>
+      <?php foreach($productCategories as $category): ?>
+        <button type="button" class="chip" data-category="<?=htmlspecialchars($category,ENT_QUOTES)?>" onclick='filterCategory(<?=json_encode($category,JSON_UNESCAPED_UNICODE)?>,this)'><?=htmlspecialchars($category)?></button>
+      <?php endforeach; ?>
     </div>
     <div id="productGrid" class="products">
       <?php foreach($products as $p): ?>
@@ -3044,7 +3053,7 @@ function loadTables(){
       <img src="${qrImg}" alt="QR ${esc(t.table_no)}">
       <button onclick="window.open('${qrImg}','_blank')" class="bg-slate-100 text-slate-700 px-2 py-1 rounded text-[11px] font-bold w-full">พิมพ์ / ดูขนาดเต็ม</button>
       <button onclick="copyTableLink('${url}')" class="bg-indigo-50 text-indigo-700 px-2 py-1 rounded text-[11px] font-bold w-full"><i class="fa-solid fa-link"></i>&nbsp; คัดลอกลิงก์</button>
-      <button onclick="deleteTable(${t.id},'${esc(t.table_no)}')" class="text-red-600 text-[11px] font-bold w-full"><i class="fa-solid fa-trash"></i>&nbsp; ลบโต๊ะ</button>
+      <button onclick='deleteTable(${Number(t.id)},${JSON.stringify(String(t.table_no||''))})' class="text-red-600 text-[11px] font-bold w-full"><i class="fa-solid fa-trash"></i>&nbsp; ลบโต๊ะ</button>
     </div>`;
   }).join('');
  });
@@ -3610,6 +3619,14 @@ function selectPay(method,el){
    }
  }
 }
+function restoreQRPaymentButtons(){
+  const payBtn=document.getElementById('qrPaymentPayBtn');
+  const cancelBtn=document.getElementById('qrPaymentCancelBtn');
+  const printBtn=document.getElementById('qrPaymentPrintBtn');
+  if(payBtn){payBtn.disabled=false;payBtn.innerHTML='<i class="fa-solid fa-money-check-dollar"></i>&nbsp; ชำระ';}
+  if(cancelBtn)cancelBtn.disabled=false;
+  if(printBtn)printBtn.disabled=!lastReceipt;
+}
 function confirmQRPayment(){
   if(payMethod!=='qr') return;
   const id=normalizePromptPayId(companyInfo.promptpayId||document.getElementById('promptpayId')?.value||'');
@@ -3623,6 +3640,7 @@ function confirmQRPayment(){
     return;
   }
   const payBtn=document.getElementById('qrPaymentPayBtn');
+  if(payBtn && payBtn.disabled)return;
   const cancelBtn=document.getElementById('qrPaymentCancelBtn');
   const printBtn=document.getElementById('qrPaymentPrintBtn');
   if(payBtn){payBtn.disabled=true;payBtn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i>&nbsp; กำลังบันทึก...';}
@@ -3637,7 +3655,9 @@ function cancelQRPayment(){
   const qrStatus=document.getElementById('promptpayQrStatus');
   if(qrStatus)qrStatus.textContent='ยกเลิกการชำระ QR';
 }
+let checkoutBusy=false;
 function checkout(fromQR=false){
+  if(checkoutBusy)return;
   if(!cart.length)return alert('กรุณาเลือกสินค้า');
   if(payMethod==='qr' && !fromQR){
     return alert('กรุณากดปุ่ม “ชำระ” เพื่อยืนยันการชำระ QR');
@@ -3649,6 +3669,7 @@ function checkout(fromQR=false){
       cash=payMethod==='cash'?Number(document.getElementById('cash').value||0):total;
 
   if(cash<total)return alert('เงินสดไม่เพียงพอ');
+  checkoutBusy=true;
 
   api('checkout',{cart:JSON.stringify(cart),cash,discount:disc,payment_method:payMethod}).then(d=>{
     if(!d.success)return alert(d.message);
@@ -3797,8 +3818,6 @@ function toggleAutoPrint(){
   autoPrint=!autoPrint;
   setAutoPrintState(autoPrint);
   api('settings_save',{
-    shopName:document.getElementById('shopName')?.value||'',
-    promptpayId:document.getElementById('promptpayId')?.value||'',
     autoPrint:autoPrint?'1':'0'
   });
 }
@@ -3821,23 +3840,62 @@ function toggleKitchenPrint(){
   kitchenPrint=!kitchenPrint;
   setKitchenPrintState(kitchenPrint);
   api('settings_save',{
-    shopName:document.getElementById('shopName')?.value||'',
-    companyAddress:document.getElementById('companyAddress')?.value||'',
-    companyPhone:document.getElementById('companyPhone')?.value||'',
-    companyTaxId:document.getElementById('companyTaxId')?.value||'',
-    promptpayId:document.getElementById('promptpayId')?.value||'',
-    autoPrint:autoPrint?'1':'0',
     kitchenPrint:kitchenPrint?'1':'0'
   });
 }
 
-function filterSale(){
- let q=document.getElementById('searchSale').value.toLowerCase().trim();
- document.querySelectorAll('.product').forEach(x=>x.style.display=(!q||x.dataset.name.includes(q)||x.dataset.barcode.includes(q)||x.dataset.sku.includes(q))?'':'none');
+let selectedSaleCategory='all';
+function applySaleFilter(){
+ const q=(document.getElementById('searchSale')?.value||'').toLowerCase().trim();
+ document.querySelectorAll('#productGrid .product').forEach(x=>{
+   const textMatch=!q||x.dataset.name.includes(q)||x.dataset.barcode.includes(q)||x.dataset.sku.includes(q);
+   const catMatch=selectedSaleCategory==='all'||x.dataset.category===selectedSaleCategory;
+   x.style.display=(textMatch&&catMatch)?'':'none';
+ });
 }
+function filterSale(){ applySaleFilter(); }
 function filterCategory(cat,btn){
- document.querySelectorAll('.chip').forEach(x=>x.classList.remove('active'));btn.classList.add('active');
- document.querySelectorAll('.product').forEach(x=>x.style.display=(cat==='all'||x.dataset.category===cat)?'':'none');
+ selectedSaleCategory=cat||'all';
+ document.querySelectorAll('#saleCategoryChips .chip').forEach(x=>x.classList.remove('active'));
+ if(btn)btn.classList.add('active');
+ applySaleFilter();
+}
+
+function refreshPosProducts(){
+  api('products').then(d=>{
+    if(!d.success)return;
+    const grid=document.getElementById('productGrid');
+    if(!grid)return;
+    const rows=Array.isArray(d.data)?d.data:[];
+    grid.innerHTML=rows.map(p=>{
+      const name=String(p.name||'');
+      const stock=Number(p.stock||0);
+      const category=String(p.category||'');
+      const image=p.image?`<img src="${esc(p.image)}" alt="img">`:`<i class="fa-solid fa-box-open"></i>`;
+      return `<button type="button" class="product"
+        data-name="${esc(name.toLowerCase())}"
+        data-barcode="${esc(String(p.barcode||'').toLowerCase())}"
+        data-sku="${esc(String(p.sku||'').toLowerCase())}"
+        data-category="${esc(category)}"
+        onclick='addToCart(${Number(p.id)},${JSON.stringify(name)},${Number(p.price||0)},${stock})'>
+        <div class="product-img">${image}</div>
+        <div class="product-info">
+          <div class="meta"><span class="category">${esc(category||'สินค้า')}</span><span>สต็อก: ${stock}</span></div>
+          <div class="product-name">${esc(name)}</div>
+          <div class="product-bottom"><span class="price">฿${money(p.price)}</span><span class="add">+</span></div>
+        </div>
+      </button>`;
+    }).join('') || '<div class="empty">ยังไม่มีเมนูในระบบ</div>';
+
+    const cats=[...new Set(rows.map(p=>String(p.category||'').trim()).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'th'));
+    const chips=document.getElementById('saleCategoryChips');
+    if(chips){
+      chips.innerHTML=`<button type="button" class="chip ${selectedSaleCategory==='all'?'active':''}" data-category="all" onclick="filterCategory('all',this)">ทั้งหมด</button>`
+        +cats.map(c=>`<button type="button" class="chip ${selectedSaleCategory===c?'active':''}" data-category="${esc(c)}" onclick='filterCategory(${JSON.stringify(c)},this)'>${esc(c)}</button>`).join('');
+      if(!cats.includes(selectedSaleCategory) && selectedSaleCategory!=='all') selectedSaleCategory='all';
+    }
+    applySaleFilter();
+  });
 }
 
 function loadProducts(){
@@ -3907,10 +3965,10 @@ function saveProduct(){
      };
  api(id?'update_product':'add_product',data).then(d=>{
   alert(d.message);
-  if(d.success){closeProductModal();loadProducts()}
+  if(d.success){closeProductModal();loadProducts();refreshPosProducts()}
  });
 }
-function deleteProduct(id){if(confirm('ต้องการลบสินค้านี้หรือไม่?'))api('delete_product',{id}).then(d=>{alert(d.message);if(d.success)loadProducts()})}
+function deleteProduct(id){if(confirm('ต้องการลบสินค้านี้หรือไม่?'))api('delete_product',{id}).then(d=>{alert(d.message);if(d.success){loadProducts();refreshPosProducts()}})}
 
 const PAY_METHOD_COLORS = {cash:'#4f46e5',transfer:'#0ea5e9',qr:'#10b981',card:'#f59e0b'};
 
@@ -4858,14 +4916,14 @@ function closeDay(){
  }
 }
 
-let companyInfo={shopName:'ร้าน POS',companyAddress:'',companyPhone:'081-234-5678',companyTaxId:'0123456789012',promptpayId:''};
+let companyInfo={shopName:'ร้าน POS',companyAddress:'',companyPhone:'',companyTaxId:'',promptpayId:''};
 
 function applySettingsData(data){
   companyInfo={
     shopName:data.shopName||'ร้าน POS',
     companyAddress:data.companyAddress||'',
-    companyPhone:data.companyPhone||'081-234-5678',
-    companyTaxId:data.companyTaxId||'0123456789012',
+    companyPhone:data.companyPhone||'',
+    companyTaxId:data.companyTaxId||'',
     promptpayId:data.promptpayId||''
   };
   shopName.value=data.shopName||'';
